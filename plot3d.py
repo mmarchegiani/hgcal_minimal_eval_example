@@ -1,5 +1,6 @@
 import os, os.path as osp, glob, uuid
 from textwrap import dedent
+from multiprocessing import Pool
 
 import numpy as np
 import torch
@@ -171,14 +172,22 @@ def side_by_side_html(
     return html
 
 
-def make_plots(model, npz_file):
+def make_plots(model, npz_file, threshold_beta=None, threshold_dist=None, device='cpu'):
+    if threshold_beta is None:
+        threshold_beta = THRESHOLD_BETA
+    if threshold_dist is None:
+        threshold_dist = THRESHOLD_DIST
+    
     data = taus2021_npz_to_torch_data(npz_file)
     data.batch = torch.ones(data.x.size(0), dtype=torch.long)
+    
+    # Move data to device
+    data = data.to(device)
     print(data)
 
-    x = data.x.numpy()
+    x = data.x.cpu().numpy()
     energy = x[:,0]
-    y_true = data.y.numpy()
+    y_true = data.y.cpu().numpy()
     
     with torch.no_grad():
         score_noise_filter, pass_noise_filter, out_gravnet = model(data)
@@ -192,25 +201,27 @@ def make_plots(model, npz_file):
     fig = plt.figure(figsize=(8,8))
     ax = fig.gca()
     bins = np.linspace(0., 1., 100)
-    hist, _, _ = ax.hist(torch.exp(score_noise_filter[:, 1]), bins=bins, label='Noise filter score')
+    hist, _, _ = ax.hist(torch.exp(score_noise_filter[:, 1]).cpu(), bins=bins, label='Noise filter score')
     ax.plot(2*[model.signal_threshold], [0., max(hist)], label='Threshold')
     ax.legend()
-    plt.savefig('tmp.png', bbox_inches='tight')
+    plot_filename = f'tmp_beta{threshold_beta:.2f}_dist{threshold_dist:.2f}.png'
+    plt.savefig(plot_filename, bbox_inches='tight')
+    plt.close()  # Close figure to free memory
     # os.system('imgcat tmp.png') # Display image in terminal; Only if you use iTerm2 and have imgcat on your path
 
     # First column of the output is the object condensation beta; don't forget the sigmoid
-    beta = torch.sigmoid(out_gravnet[:,0]).numpy()
+    beta = torch.sigmoid(out_gravnet[:,0]).cpu().numpy()
     # All other columns are the cluster space coordinates
-    cluster_space_coords = out_gravnet[:,1:].numpy()
+    cluster_space_coords = out_gravnet[:,1:].cpu().numpy()
 
     # Determine which nodes belong to which cond point according to the model.
-    y_pred_pnf = get_clustering(beta, cluster_space_coords, THRESHOLD_BETA, THRESHOLD_DIST)
+    y_pred_pnf = get_clustering(beta, cluster_space_coords, threshold_beta, threshold_dist)
 
     # This y_pred_pnf is only valid for hits that *P*assed the *N*oise *F*ilter.
     # At this point, len(y_pred) == len(out_gravnet) < len(y_true)
     # Make a new y_pred now, so that len(y_true) == len(y_pred)
     y_pred = np.zeros_like(y_true)
-    y_pred[pass_noise_filter] = y_pred_pnf
+    y_pred[pass_noise_filter.cpu()] = y_pred_pnf
 
     # Match predicted to truth
     matches = match(y_true, y_pred, energy, threshold=0.2)
@@ -251,9 +262,11 @@ def make_plots(model, npz_file):
         cluster_space_coords = PCA(3).fit_transform(cluster_space_coords)
 
     # Compile a .html file with the plots in it
-    with open('myplots.html', 'w') as f:
+    html_filename = f'myplots_beta{threshold_beta:.2f}_dist{threshold_dist:.2f}.html'
+    with open(html_filename, 'w') as f:
         f.write(dedent(f"""\
             <p>Endcap: {data.endcap}</p>
+            <p>Threshold Beta: {threshold_beta}, Threshold Distance: {threshold_dist}</p>
             <div style="display:flex">
               <div style="flex:50%">
                 <h2>Predicted clustering</h2>
@@ -278,19 +291,49 @@ def make_plots(model, npz_file):
             </div>
             """))
         f.write(side_by_side_html(
-            get_plotly_cluster_space(cluster_space_coords, y_pred[pass_noise_filter], color_map_pred, sizes),
-            get_plotly_cluster_space(cluster_space_coords, y_true[pass_noise_filter], color_map_true, sizes)
+            get_plotly_cluster_space(cluster_space_coords, y_pred[pass_noise_filter.cpu()], color_map_pred, sizes),
+            get_plotly_cluster_space(cluster_space_coords, y_true[pass_noise_filter.cpu()], color_map_true, sizes)
             ))
 
         # Hacky: Include the noise filter histogram directly into the html file as a
         # base64 string.
         import base64
-        with open('tmp.png', 'rb') as image_file:
+        with open(plot_filename, 'rb') as image_file:
             encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
         f.write(f'\n<img alt="Noise filter score" src="data:image/png;base64,{encoded_string}" />')
+    
+    print(f'Generated plots for beta={threshold_beta:.2f}, dist={threshold_dist:.2f}: {html_filename}')
+
+
+def make_plots_wrapper(args):
+    """
+    Wrapper function for multiprocessing.
+    Args should be a tuple: (model_state_dict, npz_file, threshold_beta, threshold_dist, device_id)
+    """
+    model_state_dict, npz_file, threshold_beta, threshold_dist, device_id = args
+    
+    # Determine device for this worker
+    device = torch.device(f'cuda:{device_id}' if torch.cuda.is_available() and device_id is not None else 'cpu')
+    
+    # Recreate model for this worker (each process needs its own model instance)
+    model = GravnetModelWithNoiseFilter(
+        input_dim=9,
+        output_dim=6,
+        k=50,
+        signal_threshold=.05
+    )
+    model.load_state_dict(model_state_dict)
+    model.to(device)
+    model.eval()
+    
+    return make_plots(model, npz_file, threshold_beta, threshold_dist, device)
 
 
 def main():
+    # Check for CUDA availability
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Using device: {device}')
+    
     # Load weights into model
     ckpt = 'ckpt_train_taus_integrated_noise_Oct20_212115_best_397.pth.tar'
     model = GravnetModelWithNoiseFilter(
@@ -299,11 +342,47 @@ def main():
         k=50,
         signal_threshold=.05
         )
-    model.load_state_dict(torch.load(ckpt, map_location=torch.device('cpu'))['model'])
+    model.load_state_dict(torch.load(ckpt, map_location=device)['model'])
+    model.to(device)
     model.eval()
 
     # One file example now
     npz_files = glob.glob('events/*.npz')
-    make_plots(model, npz_files[0])
+    if not npz_files:
+        print("No .npz files found in 'events/' directory")
+        return
+    
+    npz_file = npz_files[0]
+    
+    # Define parameter ranges for grid search
+    threshold_betas = [0.1, 0.2, 0.3]
+    threshold_dists = [0.3, 0.5, 0.7]
+    
+    # Create parameter combinations
+    param_combinations = [(beta, dist) for beta in threshold_betas for dist in threshold_dists]
+    
+    # Determine number of available GPUs and processes
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    num_processes = max(1, num_gpus) if num_gpus > 0 else 8  # Use CPU cores if no GPU
+    
+    print(f'Running {len(param_combinations)} parameter combinations on {num_processes} processes')
+    print(f'Parameter combinations: {param_combinations}')
+    
+    # Prepare arguments for multiprocessing
+    model_state_dict = model.state_dict()
+    args_list = []
+    
+    for i, (threshold_beta, threshold_dist) in enumerate(param_combinations):
+        # Distribute work across available devices
+        device_id = i % num_gpus if num_gpus > 0 else None
+        args_list.append((model_state_dict, npz_file, threshold_beta, threshold_dist, device_id))
+    
+    # Use multiprocessing to run in parallel
+    with Pool(processes=num_processes) as pool:
+        pool.map(make_plots_wrapper, args_list)
+    
+    print("All parameter combinations completed!")
 
-main()
+
+if __name__ == '__main__':
+    main()
